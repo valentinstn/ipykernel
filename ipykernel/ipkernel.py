@@ -22,6 +22,7 @@ from zmq.eventloop.zmqstream import ZMQStream
 from .comm.comm import BaseComm
 from .comm.manager import CommManager
 from .compiler import XCachingCompiler
+from .debugger import Debugger
 from .eventloops import _use_appnope
 from .kernelbase import Kernel as KernelBase
 from .kernelbase import _accepts_parameters
@@ -74,9 +75,11 @@ class IPythonKernel(KernelBase):
     shell = Instance("IPython.core.interactiveshell.InteractiveShellABC", allow_none=True)
     shell_class = Type(ZMQInteractiveShell)
 
-    # use fully-qualified name to ensure lazy import and prevent the issue from
-    # https://github.com/ipython/ipykernel/issues/1198
-    debugger_class = Type("ipykernel.debugger.Debugger")
+    # Resolve the debugger class while importing ipykernel, before any channel
+    # threads are started.  Resolving this Type lazily during Kernel instance
+    # creation can import debugpy while another helper thread holds the import
+    # lock, wedging kernel startup under amd64 emulation.
+    debugger_class = Type(Debugger)
 
     compiler_class = Type(XCachingCompiler)
 

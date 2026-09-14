@@ -88,6 +88,15 @@ def test_start_kernel_background_thread():
         assert "1" in text
 
 
+def test_debugger_class_is_resolved_before_kernel_start():
+    """The debugger trait must not lazily import debugpy during startup."""
+    from ipykernel.debugger import Debugger
+    from ipykernel.ipkernel import IPythonKernel
+
+    debugger_trait = IPythonKernel.class_traits()["debugger_class"]
+    assert debugger_trait.klass is Debugger
+
+
 def test_profile_startup_import_does_not_deadlock(tmp_path):
     """Profile imports must finish before the channel threads are started."""
     profile = tmp_path / "profile"
