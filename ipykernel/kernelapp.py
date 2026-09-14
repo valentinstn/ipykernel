@@ -612,10 +612,6 @@ class IPKernelApp(BaseIPythonApplication, InteractiveShellApp, ConnectionFileMix
         control_stream = ZMQStream(self.control_socket, self.control_thread.io_loop)
         debugpy_stream = ZMQStream(self.debugpy_socket, self.control_thread.io_loop)
 
-        self.control_thread.start()
-        if self.shell_channel_thread:
-            self.shell_channel_thread.start()
-
         kernel_factory = self.kernel_class.instance  # type:ignore[attr-defined]
 
         kernel = kernel_factory(
@@ -639,6 +635,18 @@ class IPKernelApp(BaseIPythonApplication, InteractiveShellApp, ConnectionFileMix
 
         # Allow the displayhook to get the execution count
         self.displayhook.get_execution_count = lambda: kernel.execution_count
+
+    def _start_background_threads(self):
+        """Start channel threads after Python-level kernel initialization.
+
+        Profile startup code can import modules while holding Python's import
+        lock.  Starting the channel threads first lets their callbacks import
+        the same modules and deadlock kernel startup.
+        """
+        if self.control_thread and self.control_thread.ident is None:
+            self.control_thread.start()
+        if self.shell_channel_thread and self.shell_channel_thread.ident is None:
+            self.shell_channel_thread.start()
 
     def init_gui_pylab(self):
         """Enable GUI event loop integration, taking pylab into account."""
@@ -752,6 +760,7 @@ class IPKernelApp(BaseIPythonApplication, InteractiveShellApp, ConnectionFileMix
             return self.subapp.start()
         if self.poller is not None:
             self.poller.start()
+        self._start_background_threads()
         self.kernel.start()
         self.io_loop = ioloop.IOLoop.current()
         if self.trio_loop:
