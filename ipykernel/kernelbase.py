@@ -59,6 +59,7 @@ from ipykernel.jsonutil import json_clean
 
 from ._version import kernel_protocol_version
 from .iostream import OutStream
+from .subshell_manager import UnknownSubshellError
 from .utils import LazyDict, _async_in_context
 
 psutil: t.Any | None = None
@@ -418,7 +419,9 @@ class Kernel(SingletonConfigurable):
         """
         return True
 
-    async def dispatch_shell(self, msg, /, subshell_id: str | None = None):
+    async def dispatch_shell(
+        self, msg, /, subshell_id: str | None = None, *, concurrent: bool = False
+    ):
         """dispatch shell requests"""
         if len(msg) == 1 and msg[0].buffer == b"stop aborting":
             # Dummy "stop aborting" message to stop aborting execute requests on this subshell.
@@ -449,10 +452,12 @@ class Kernel(SingletonConfigurable):
 
         # Set the parent message for side effects.
         self.set_parent(idents, msg, channel="shell")
-        self._publish_status("busy", "shell")
+        if not concurrent:
+            self._publish_status("busy", "shell")
 
         msg_type = msg["header"]["msg_type"]
-        assert msg["header"].get("subshell_id") == subshell_id
+        if msg_type not in {"comm_msg", "comm_close"}:
+            assert msg["header"].get("subshell_id") == subshell_id
 
         if self._supports_kernel_subshells:
             stream = self.shell_channel_thread.manager.get_subshell_to_shell_channel_socket(
@@ -482,7 +487,8 @@ class Kernel(SingletonConfigurable):
         if inspect.isawaitable(should_handle):
             should_handle = await should_handle
         if not should_handle:
-            self._publish_status_and_flush("idle", "shell", stream)
+            if not concurrent:
+                self._publish_status_and_flush("idle", "shell", stream)
             self.log.debug("Not handling %s:%s", msg_type, msg["header"].get("msg_id"))
             return
 
@@ -491,10 +497,11 @@ class Kernel(SingletonConfigurable):
             self.log.warning("Unknown message type: %r", msg_type)
         else:
             self.log.debug("%s: %s", msg_type, msg)
-            try:
-                self.pre_handler_hook()
-            except Exception:
-                self.log.debug("Unable to signal in pre_handler_hook:", exc_info=True)
+            if not concurrent:
+                try:
+                    self.pre_handler_hook()
+                except Exception:
+                    self.log.debug("Unable to signal in pre_handler_hook:", exc_info=True)
             try:
                 result = handler(stream, idents, msg)
                 if inspect.isawaitable(result):
@@ -505,16 +512,18 @@ class Kernel(SingletonConfigurable):
                 # Ctrl-c shouldn't crash the kernel here.
                 self.log.error("KeyboardInterrupt caught in kernel.")
             finally:
-                try:
-                    self.post_handler_hook()
-                except Exception:
-                    self.log.debug("Unable to signal in post_handler_hook:", exc_info=True)
+                if not concurrent:
+                    try:
+                        self.post_handler_hook()
+                    except Exception:
+                        self.log.debug("Unable to signal in post_handler_hook:", exc_info=True)
 
         if sys.stdout is not None:
             sys.stdout.flush()
         if sys.stderr is not None:
             sys.stderr.flush()
-        self._publish_status_and_flush("idle", "shell", stream)
+        if not concurrent:
+            self._publish_status_and_flush("idle", "shell", stream)
 
     def pre_handler_hook(self):
         """Hook to execute before calling message handler"""
@@ -566,10 +575,11 @@ class Kernel(SingletonConfigurable):
         """register dispatchers for streams"""
         self.io_loop = ioloop.IOLoop.current()
 
+        # Create the lock before the control_stream, so the lock is guaranteed to be available.
+        self._control_lock = asyncio.Lock()
+
         if self.control_stream:
             self.control_stream.on_recv(self.dispatch_control, copy=False)
-
-        self._control_lock = asyncio.Lock()
 
         if self.shell_stream:
             if self.shell_channel_thread:
@@ -594,14 +604,28 @@ class Kernel(SingletonConfigurable):
 
             # deserialize only the header to get subshell_id
             # Keep original message to send to subshell_id unmodified.
-            _, msg2 = self.session.feed_identities(msg, copy=False)
+            idents, msg2 = self.session.feed_identities(msg, copy=False)
             try:
                 msg3 = self.session.deserialize(msg2, content=False, copy=False)
                 subshell_id = msg3["header"].get("subshell_id")
 
+                if msg3["header"]["msg_type"] in {"comm_msg", "comm_close"} and hasattr(
+                    self, "comm_manager"
+                ):
+                    content = self.session.unpack(msg3["content"])
+                    comm = self.comm_manager.get_comm(content.get("comm_id"))
+                    if comm is not None:
+                        route = getattr(comm, "_reply_subshell_for", None)
+                        if route is not None:
+                            subshell_id = route(content.get("data"), subshell_id)
+
                 # Find inproc pair socket to use to send message to correct subshell.
                 subshell_manager = self.shell_channel_thread.manager
-                socket = subshell_manager.get_shell_channel_to_subshell_socket(subshell_id)
+                try:
+                    socket = subshell_manager.get_shell_channel_to_subshell_socket(subshell_id)
+                except UnknownSubshellError as err:
+                    self._send_unknown_subshell_reply(idents, msg3, err)
+                    return
                 assert socket is not None
                 socket.send_multipart(msg, copy=False)
             except Exception:
@@ -630,6 +654,26 @@ class Kernel(SingletonConfigurable):
         # async cells at the same time which would be a nice feature to have but is an API
         # change.
         assert asyncio_lock is not None
+        if asyncio_lock.locked() and self.session is not None:
+            try:
+                _, frames = self.session.feed_identities(msg, copy=False)
+                header = self.session.deserialize(frames, content=False, copy=False)["header"]
+            except Exception:
+                header = {}
+            if header.get("msg_type") in {"comm_open", "comm_msg", "comm_close"}:
+                # A running async cell may be waiting for a widget reply on this
+                # channel. Dispatch comms without waiting for the cell's lock.
+                shell_parent = self.get_parent("shell")
+                shell_ident = self._get_shell_context_var(self._shell_parent_ident)
+                try:
+                    comm_task = asyncio.create_task(
+                        self.dispatch_shell(msg, subshell_id=subshell_id, concurrent=True),
+                        context=copy_context(),
+                    )
+                    await comm_task
+                finally:
+                    self.set_parent(shell_ident, shell_parent, channel="shell")
+                return
         async with asyncio_lock:
             await self.dispatch_shell(msg, subshell_id=subshell_id)
 
@@ -1377,6 +1421,43 @@ class Kernel(SingletonConfigurable):
             parent=msg,
             ident=idents,
         )
+
+    def _send_unknown_subshell_reply(
+        self, idents, msg: dict[str, t.Any], err: UnknownSubshellError
+    ) -> None:
+        """Send an error reply to a request addressed to a subshell that is not there.
+
+        Runs in the shell channel thread, so it writes to the shell socket
+        directly instead of going through a subshell.
+
+        The busy and idle status messages matter as much as the reply here.
+        A client tracks the completion of a request by the idle status that
+        carries it as parent, and for message types that have no reply, such as
+        the comm messages, that status is all it has to go on.
+        """
+        if not self.session:
+            return
+        msg_type = msg["header"]["msg_type"]
+        self.log.warning("Cannot handle %s %s: %s", msg_type, msg["header"]["msg_id"], err)
+        self._publish_status("busy", "shell", parent=msg)
+        content = {
+            "status": "error",
+            "ename": type(err).__name__,
+            "evalue": str(err),
+            "traceback": [],
+        }
+        md = self.init_metadata(msg)
+        md = self.finish_metadata(msg, md, content)
+        md.update({"status": "error"})
+        self.session.send(
+            self.shell_stream,
+            msg_type.rsplit("_", 1)[0] + "_reply",
+            metadata=md,
+            content=content,
+            parent=msg,
+            ident=idents,
+        )
+        self._publish_status("idle", "shell", parent=msg)
 
     def _no_raw_input(self):
         """Raise StdinNotImplementedError if active frontend doesn't support
