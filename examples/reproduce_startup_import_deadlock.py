@@ -95,6 +95,8 @@ def main() -> int:
 
             if not connection_file.exists():
                 print("Kernel did not create a connection file.")
+                if process.poll() is not None and process.stdout:
+                    print(process.stdout.read(), end="")
                 return 1
 
             client = BlockingKernelClient(connection_file=str(connection_file))
@@ -103,9 +105,15 @@ def main() -> int:
             try:
                 client.wait_for_ready(timeout=3)
             except Exception as error:
-                print("REPRODUCED: kernel_info did not arrive (the kernel is stuck).")
+                if process.poll() is None:
+                    print("REPRODUCED: kernel process stayed alive but did not answer kernel_info.")
+                    print(f"{type(error).__name__}: {error}")
+                    return 0
+                print(f"Kernel exited before answering kernel_info (exit code {process.returncode}).")
                 print(f"{type(error).__name__}: {error}")
-                return 0
+                if process.stdout:
+                    print(process.stdout.read(), end="")
+                return 1
             else:
                 print("Kernel became ready; the startup-order fix is present.")
                 return 0
