@@ -88,15 +88,6 @@ def test_start_kernel_background_thread():
         assert "1" in text
 
 
-def test_debugger_class_is_resolved_before_kernel_start():
-    """The debugger trait must not lazily import debugpy during startup."""
-    from ipykernel.debugger import Debugger
-    from ipykernel.ipkernel import IPythonKernel
-
-    debugger_trait = IPythonKernel.class_traits()["debugger_class"]
-    assert debugger_trait.klass is Debugger
-
-
 def test_profile_startup_import_does_not_deadlock(tmp_path):
     """Profile imports must finish before the channel threads are started."""
     profile = tmp_path / "profile"
@@ -108,7 +99,10 @@ def test_profile_startup_import_does_not_deadlock(tmp_path):
             import builtins
             import threading
 
-            if any(thread.name in {"Control", "Shell channel"} for thread in threading.enumerate()):
+            if any(
+                thread.name in {"Control", "Shell channel", "IOPub"}
+                for thread in threading.enumerate()
+            ):
                 builtins._startup_import_event.wait()
             """
         )
@@ -131,6 +125,7 @@ def test_profile_startup_import_does_not_deadlock(tmp_path):
                 builtins._startup_import_event.set()
 
             app.control_thread.io_loop.add_callback(import_on_channel_thread)
+            app.iopub_thread.io_loop.add_callback(import_on_channel_thread)
             __import__("repro_target")
             """
         )

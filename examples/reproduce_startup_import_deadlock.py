@@ -37,9 +37,10 @@ def import_on_channel_thread():
     builtins._startup_import_event.set()
 
 
-# The old startup order has already started this thread.  The fixed order
-# queues this callback until after profile startup has finished.
+# The old startup order has already started these threads.  The fixed order
+# queues the callbacks until after profile startup has finished.
 app.control_thread.io_loop.add_callback(import_on_channel_thread)
+app.iopub_thread.io_loop.add_callback(import_on_channel_thread)
 __import__("repro_target")
 """
 
@@ -52,7 +53,10 @@ import threading
 # thread tries to import it too.  The main thread waits for that callback,
 # while the callback waits for this import lock: a minimal two-thread import
 # deadlock.
-if any(thread.name in {"Control", "Shell channel"} for thread in threading.enumerate()):
+if any(
+    thread.name in {"Control", "Shell channel", "IOPub"}
+    for thread in threading.enumerate()
+):
     builtins._startup_import_event.wait()
 """
 

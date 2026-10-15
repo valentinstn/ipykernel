@@ -423,7 +423,6 @@ class IPKernelApp(BaseIPythonApplication, InteractiveShellApp, ConnectionFileMix
         self.log.debug("iopub PUB Channel on port: %i", self.iopub_port)
         self.configure_tornado_logger()
         self.iopub_thread = IOPubThread(self.iopub_socket, pipe=True, session=self.session)
-        self.iopub_thread.start()
         # backward-compat: wrap iopub socket API in background thread
         self.iopub_socket = self.iopub_thread.background_socket
 
@@ -640,9 +639,11 @@ class IPKernelApp(BaseIPythonApplication, InteractiveShellApp, ConnectionFileMix
         """Start channel threads after Python-level kernel initialization.
 
         Profile startup code can import modules while holding Python's import
-        lock.  Starting the channel threads first lets their callbacks import
-        the same modules and deadlock kernel startup.
+        lock. Starting the channel threads before that code completes lets
+        their callbacks import the same modules and deadlock kernel startup.
         """
+        if self.iopub_thread and self.iopub_thread.thread.ident is None:
+            self.iopub_thread.start()
         if self.control_thread and self.control_thread.ident is None:
             self.control_thread.start()
         if self.shell_channel_thread and self.shell_channel_thread.ident is None:

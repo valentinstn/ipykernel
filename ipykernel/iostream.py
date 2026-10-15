@@ -305,8 +305,17 @@ class IOPubThread:
 
     def stop(self):
         """Stop the IOPub thread"""
+        was_stopped = self._stopped
         self._stopped = True
         if not self.thread.is_alive():
+            if self.thread.ident is None and not was_stopped:
+                # The thread may be deliberately started later by IPKernelApp.
+                # Close resources registered on the loop when an app is closed
+                # before its background threads are started.
+                self.io_loop.close(all_fds=True)
+                for event_pipe in self._event_pipes.values():
+                    event_pipe.close()
+                self._event_pipes.clear()
             return
         self.io_loop.add_callback(self.io_loop.stop)
 
